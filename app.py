@@ -20,8 +20,6 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
 from pydantic import BaseModel, Field
 
 # CLIP for semantic image filtering
@@ -540,39 +538,25 @@ async def scrape_images(
         # Build Google News URL
         url = f"https://news.google.com/search?q={quote_plus(q)}"
         
-        # Launch browser and get page content
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
+        # Fetch page content with httpx (no browser needed)
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": BROWSER_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                }
             )
-            try:
-                context = await browser.new_context(
-                    viewport={"width": 1920, "height": 1080},
-                    user_agent=BROWSER_USER_AGENT,
-                )
-                page = await context.new_page()
-                await Stealth().apply_stealth_async(page)
-                
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(2000)
-                
-                # Scroll extensively to load more images
-                await page.evaluate("""
-                    async () => {
-                        for (let i = 0; i < 10; i++) {
-                            window.scrollBy(0, 1000);
-                            await new Promise(r => setTimeout(r, 300));
-                        }
-                        window.scrollTo(0, 0);
-                    }
-                """)
-                await page.wait_for_timeout(1000)
-                
-                html_content = await page.content()
-                final_url = page.url
-            finally:
-                await browser.close()
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch Google News: {response.status_code}")
+            
+            html_content = response.text
+            final_url = str(response.url)
         
         # Extract all image URLs with context and relevance scoring
         image_urls = extract_image_urls(html_content, final_url, query=q)
