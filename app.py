@@ -4,9 +4,11 @@ Implements streaming approach with CLIP-based semantic filtering.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
+import os
 import re
 import shutil
 from pathlib import Path
@@ -158,6 +160,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Keep-alive self-ping to prevent cold starts on Render
+KEEP_ALIVE_INTERVAL = 13 * 60  # 13 minutes in seconds
+
+async def keep_alive_ping():
+    """Background task to ping ourselves every 13 minutes to prevent cold starts."""
+    # Get the service URL from environment (Render sets RENDER_EXTERNAL_URL)
+    service_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+    health_url = f"{service_url}/health"
+    
+    while True:
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(health_url, timeout=30)
+                print(f"Keep-alive ping: {response.status_code}")
+        except Exception as e:
+            print(f"Keep-alive ping failed: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on app startup."""
+    # Only run keep-alive in production (when RENDER_EXTERNAL_URL is set)
+    if os.environ.get("RENDER_EXTERNAL_URL"):
+        asyncio.create_task(keep_alive_ping())
+        print("Keep-alive background task started")
 
 
 class ImageItem(BaseModel):
@@ -460,8 +490,14 @@ async def download_and_validate_image(
 
 
 @app.get("/", tags=["Health"])
+async def root():
+    return {"status": "ok", "message": "Google News Image Scraper API v2.0 - CLIP Filtering"}
+
+
+@app.get("/health", tags=["Health"])
 async def health_check():
-    return {"status": "ok", "message": "Google News Image Scraper API v2.0 - Streaming Mode"}
+    """Health check endpoint for keep-alive pings."""
+    return {"status": "healthy", "timestamp": __import__("datetime").datetime.now().isoformat()}
 
 
 @app.get("/scrape", response_model=ScrapeResponse, tags=["Scraping"])
