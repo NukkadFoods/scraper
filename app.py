@@ -398,6 +398,25 @@ def upscale_google_news_url(url: str, target_width: int = 1200) -> str:
     return url
 
 
+async def fetch_duckduckgo_images(query: str, client: httpx.AsyncClient) -> tuple[str, str]:
+    """
+    Fallback: Fetch images from DuckDuckGo (more lenient with datacenter IPs).
+    Returns (html_content, final_url).
+    """
+    # DuckDuckGo image search URL
+    url = f"https://duckduckgo.com/?q={quote_plus(query)}&iax=images&ia=images"
+
+    headers = {
+        "User-Agent": get_random_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+    }
+
+    response = await client.get(url, headers=headers)
+    return response.text, str(response.url)
+
+
 def extract_image_urls(html: str, base_url: str, query: str = "") -> list[dict]:
     """
     Extract all image URLs from HTML with context for relevance filtering.
@@ -746,24 +765,50 @@ async def scrape_images(
             query_info = await analyze_query_with_groq(q, client)
             print(f"Query '{q}' analyzed: type={query_info.get('type')}, aliases={query_info.get('aliases', [])[:3]}")
 
-            # Step 2: Fetch Google News page
-            response = await client.get(
-                url,
-                headers={
+            # Step 2: Fetch Google News page with retry logic
+            max_retries = 3
+            response = None
+
+            for attempt in range(max_retries):
+                # Add small random delay to appear more human-like
+                if attempt > 0:
+                    await asyncio.sleep(random.uniform(1, 3))
+
+                # Full browser-like headers
+                headers = {
                     "User-Agent": get_random_user_agent(),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
                     "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0",
                 }
-            )
+
+                response = await client.get(url, headers=headers)
+
+                if response.status_code == 200:
+                    break
+                elif response.status_code == 429:
+                    print(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying...")
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                else:
+                    break
 
             if response.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Failed to fetch Google News: {response.status_code}")
-
-            html_content = response.text
-            final_url = str(response.url)
+                # Fallback to DuckDuckGo if Google is blocked
+                print(f"Google News blocked ({response.status_code}), trying DuckDuckGo...")
+                try:
+                    html_content, final_url = await fetch_duckduckgo_images(q, client)
+                except Exception as ddg_err:
+                    raise HTTPException(status_code=502, detail=f"Both Google ({response.status_code}) and DuckDuckGo failed")
+            else:
+                html_content = response.text
+                final_url = str(response.url)
 
         # Extract all image URLs with context and relevance scoring
         image_urls = extract_image_urls(html_content, final_url, query=q)
