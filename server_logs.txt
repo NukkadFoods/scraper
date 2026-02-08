@@ -1,0 +1,10 @@
+/Users/ajay/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+INFO:     Started server process [61562]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[0;93m2026-02-08 20:49:44.993672 [W:onnxruntime:, coreml_execution_provider.cc:107 GetCapability] CoreMLExecutionProvider::GetCapability, number of partitions supported by CoreML: 6 number of nodes in the graph: 889 number of nodes supported by CoreML: 30[m
+[0;93m2026-02-08 20:49:47.182729 [W:onnxruntime:, helper.cc:82 IsInputSupported] CoreML does not support input dim > 16384. Input:token_embedding.weight, shape: {49408,512}[m
+[0;93m2026-02-08 20:49:47.183655 [W:onnxruntime:, coreml_execution_provider.cc:107 GetCapability] CoreMLExecutionProvider::GetCapability, number of partitions supported by CoreML: 4 number of nodes in the graph: 910 number of nodes supported by CoreML: 18[m
+INFO:     127.0.0.1:54620 - "GET /scrape?q=akash+chopra&count=5&strict=false HTTP/1.1" 200 OK

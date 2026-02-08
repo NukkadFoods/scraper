@@ -9,5 +9,5 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /ms-playwright
+      - key: GROQ_API_KEY
+        sync: false  # Set manually in Render dashboard for security

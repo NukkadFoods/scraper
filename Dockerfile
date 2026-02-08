@@ -1,17 +1,13 @@
-# Use lightweight Python image
+# Lightweight Python image - no heavy ML dependencies
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for OpenCV and ONNX Runtime
+# Minimal system deps for Pillow (image processing)
 RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglx-mesa0 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
+    libjpeg62-turbo \
+    libpng16-16 \
+    libwebp7 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -29,5 +25,5 @@ RUN mkdir -p /app/response
 # Expose port (Render sets PORT dynamically)
 EXPOSE 8000
 
-# Run the application - use shell form to expand $PORT
+# Run the application
 CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}

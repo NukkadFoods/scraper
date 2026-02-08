@@ -1,6 +1,6 @@
 """
 FastAPI Backend for Google News Image Scraper
-Implements streaming approach with CLIP-based semantic filtering.
+Uses Groq LLM for intelligent metadata-based filtering (no heavy ML models).
 """
 from __future__ import annotations
 
@@ -8,12 +8,21 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus, urlparse
+import urllib.parse
+
+# Load .env for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not required in production
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,9 +30,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, Field
-
-# CLIP for semantic image filtering
-from onnx_clip import OnnxClip
+from starlette.concurrency import run_in_threadpool
 
 # Response folder path
 RESPONSE_DIR = Path(__file__).parent / "response"
@@ -38,118 +45,198 @@ BROWSER_USER_AGENT = (
 # Known logo/icon hashes to block
 BLOCKED_HASHES = {"8c30b0eaece8e454"}  # Google News logo
 
-# Initialize CLIP model (loads once on startup)
-_clip_model: OnnxClip | None = None
+# Groq API configuration
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("groqapikey", "")
+GROQ_MODEL = "llama-3.1-8b-instant"  # Fast and free
 
-def get_clip_model() -> OnnxClip:
-    """Lazy-load CLIP model on first use."""
-    global _clip_model
-    if _clip_model is None:
-        _clip_model = OnnxClip(batch_size=1)
-    return _clip_model
+# Cache for query analysis (avoid repeated API calls)
+_query_cache: dict[str, dict] = {}
 
 
-def check_image_relevance(
-    image_bytes: bytes, 
-    query: str, 
-    threshold: float = 0.25,
-    solo_only: bool = True
-) -> tuple[bool, float, bool]:
+async def analyze_query_with_groq(query: str, client: httpx.AsyncClient) -> dict:
     """
-    Use CLIP to check if an image shows the queried subject (person/thing).
-    
-    Args:
-        image_bytes: Raw image data
-        query: Search query (e.g., "trump")
-        threshold: Minimum relevance score (0-1)
-        solo_only: If True, reject group photos for person queries
-    
-    Returns (is_relevant, confidence_score, is_solo)
+    Use Groq to analyze the query and extract search intelligence.
+    Returns: {
+        "type": "person" | "topic" | "object" | "event",
+        "canonical_name": str,  # Full proper name if person
+        "aliases": list[str],   # Alternative names/spellings
+        "keywords": list[str],  # Related terms to look for
+        "negative_keywords": list[str],  # Terms that indicate wrong match
+        "description": str      # Brief description for context
+    }
     """
+    cache_key = query.lower().strip()
+    if cache_key in _query_cache:
+        return _query_cache[cache_key]
+
+    if not GROQ_API_KEY:
+        # Fallback without API
+        return {
+            "type": "unknown",
+            "canonical_name": query,
+            "aliases": [query.lower()],
+            "keywords": query.lower().split(),
+            "negative_keywords": [],
+            "description": ""
+        }
+
+    prompt = f"""Analyze this search query for finding images: "{query}"
+
+Return a SINGLE JSON object (not an array) with these fields:
+- type: "person", "topic", "object", or "event"
+- canonical_name: Full proper name (e.g., "Donald Trump" for "trump")
+- aliases: List of alternative names/spellings to match in text
+- keywords: Related terms that suggest relevance
+- negative_keywords: Terms that indicate a DIFFERENT subject (for disambiguation)
+- description: One-line description
+
+Example for "modi":
+{{"type":"person","canonical_name":"Narendra Modi","aliases":["Modi","PM Modi","Narendra Damodardas Modi"],"keywords":["india","prime minister","bjp"],"negative_keywords":["lalit modi","nirav modi"],"description":"Prime Minister of India"}}
+
+Return ONLY the JSON object, no markdown or explanation."""
+
     try:
-        clip = get_clip_model()
-        import numpy as np
-        
-        # Open and resize image for faster processing
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        # Resize large images to speed up CLIP (CLIP uses 224x224 anyway)
-        if max(image.size) > 512:
-            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
-        
-        # Check if this is likely a person query
-        is_person_query = len(query.split()) <= 2 and not any(
-            word in query.lower() for word in ["landscape", "building", "car", "food", "animal", "house", "city"]
+        response = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 250
+            },
+            timeout=10.0
         )
-        
-        if is_person_query:
-            # More inclusive prompts to handle masked characters (e.g. Spiderman)
-            labels = [
-                f"a close-up photo showing {query}, face or mask clearly visible",
-                f"a photo of {query} standing with other people in a group",
-                "a photo of a building, landscape, or scene without any person",
-                "a photo of someone else, a different person",
-            ]
-        else:
-            # General object/thing query
-            labels = [
-                f"a photo of {query}",
-                "a photo of something completely different and unrelated",
-            ]
-        
-        # Get embeddings
-        image_embedding = clip.get_image_embeddings([image])
-        text_embeddings = clip.get_text_embeddings(labels)
-        
-        # Calculate similarities
-        similarities = (image_embedding @ text_embeddings.T).flatten()
-        
-        # Softmax to get probabilities
-        exp_sims = np.exp(similarities - np.max(similarities))
-        probs = exp_sims / exp_sims.sum()
-        
-        if is_person_query:
-            solo_score = float(probs[0])      # Face clearly visible, alone
-            group_score = float(probs[1])     # In a group
-            building_score = float(probs[2])  # No person - building/landscape
-            other_person_score = float(probs[3])  # Different person
-            
-            # Person is visible if solo OR group score is significant
-            person_visible = solo_score + group_score
-            
-            # Reject if it's a building/landscape without the person
-            if building_score > person_visible:
-                return False, solo_score, False
-            
-            # Reject if it's a different person entirely
-            if other_person_score > person_visible:
-                return False, solo_score, False
-            
-            # Check minimum threshold
-            is_relevant = person_visible > threshold
-            
-            # Determine if solo
-            is_solo = solo_score > group_score
-            
-            # In solo_only mode, reject group photos
-            if solo_only and not is_solo and is_relevant:
-                is_relevant = False
-            
-            return is_relevant, solo_score, is_solo
-        else:
-            # Standard relevance check
-            positive_prob = float(probs[0])
-            is_relevant = positive_prob > threshold
-            return is_relevant, positive_prob, True
-        
+
+        if response.status_code == 200:
+            content = response.json()["choices"][0]["message"]["content"]
+            # Parse JSON from response
+            content = content.strip()
+            if content.startswith("```"):
+                parts = content.split("```")
+                content = parts[1] if len(parts) > 1 else parts[0]
+                if content.startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+            result = json.loads(content)
+
+            # Handle if LLM returns a list instead of object
+            if isinstance(result, list) and len(result) > 0:
+                result = result[0]
+
+            if isinstance(result, dict):
+                _query_cache[cache_key] = result
+                print(f"Groq analysis: {query} -> type={result.get('type')}, canonical={result.get('canonical_name')}")
+                return result
     except Exception as e:
-        print(f"CLIP error: {e}")
-        return True, 0.0, True
+        print(f"Groq query analysis error: {e}")
+
+    # Fallback: basic text matching
+    fallback = {
+        "type": "unknown",
+        "canonical_name": query,
+        "aliases": [query.lower(), query.title(), query.upper()],
+        "keywords": query.lower().split(),
+        "negative_keywords": [],
+        "description": ""
+    }
+    _query_cache[cache_key] = fallback
+    return fallback
+
+
+def check_text_relevance(
+    context_text: str,
+    query_info: dict,
+    query: str
+) -> tuple[bool, float, bool, dict]:
+    """
+    Check if image context text indicates relevance to the query.
+    Uses intelligent text matching with Groq-provided query intelligence.
+
+    Returns: (is_relevant, confidence_score, is_solo, debug_scores)
+    """
+    context_lower = context_text.lower()
+    query_lower = query.lower()
+
+    canonical = query_info.get("canonical_name", query).lower()
+    aliases = [a.lower() for a in query_info.get("aliases", [query])]
+    keywords = [k.lower() for k in query_info.get("keywords", [])]
+    negative_keywords = [n.lower() for n in query_info.get("negative_keywords", [])]
+    query_type = query_info.get("type", "unknown")
+
+    scores = {
+        "exact_match": 0,
+        "alias_match": 0,
+        "keyword_match": 0,
+        "negative_match": 0,
+        "query_type": query_type
+    }
+
+    # 1. Exact canonical name match (highest weight)
+    if canonical in context_lower:
+        scores["exact_match"] = 1.0
+
+    # 2. Alias matches
+    alias_matches = sum(1 for alias in aliases if alias in context_lower)
+    if alias_matches > 0:
+        scores["alias_match"] = min(1.0, alias_matches * 0.4)
+
+    # 3. Keyword matches (supporting evidence)
+    keyword_matches = sum(1 for kw in keywords if kw in context_lower and len(kw) > 2)
+    if keyword_matches > 0:
+        scores["keyword_match"] = min(0.5, keyword_matches * 0.15)
+
+    # 4. Negative keyword check (reduces confidence)
+    negative_matches = sum(1 for neg in negative_keywords if neg in context_lower)
+    if negative_matches > 0:
+        scores["negative_match"] = min(0.8, negative_matches * 0.3)
+
+    # Calculate final score
+    positive_score = scores["exact_match"] + scores["alias_match"] + scores["keyword_match"]
+    negative_penalty = scores["negative_match"]
+
+    # For person queries, check for group indicators
+    is_solo = True
+    if query_type == "person":
+        group_indicators = ["with", "meets", "and", "alongside", "together", "group", "team", "family"]
+        if any(ind in context_lower for ind in group_indicators):
+            # Check if the query subject is the focus despite group context
+            # e.g., "Trump meets Biden" - Trump is still the subject
+            words_before_indicator = context_lower.split(canonical)[0] if canonical in context_lower else ""
+            if len(words_before_indicator) < 20:  # Subject is early in text = likely the focus
+                is_solo = True
+            else:
+                is_solo = False
+                scores["group_indicator"] = True
+
+    final_score = max(0, min(1.0, positive_score - negative_penalty))
+
+    # Relevance threshold
+    is_relevant = final_score >= 0.3 or (scores["exact_match"] > 0)
+
+    # If we have strong negative matches and weak positive, reject
+    if negative_penalty > positive_score and scores["exact_match"] == 0:
+        is_relevant = False
+
+    return is_relevant, final_score, is_solo, scores
 
 app = FastAPI(
     title="Google News Image Scraper API",
-    description="Scrape unique, full-size images from Google News with guaranteed count",
-    version="2.0.0",
+    description="Scrape relevant images from Google News using Groq-powered intelligent filtering",
+    version="3.0.0",
 )
+
+@app.on_event("startup")
+def startup_event():
+    """Initialize on startup."""
+    if GROQ_API_KEY:
+        print(f"Groq API configured (model: {GROQ_MODEL})")
+    else:
+        print("WARNING: No Groq API key found. Using basic text matching.")
+    print("Image scraper ready (lightweight mode - no ML models).")
 
 app.add_middleware(
     CORSMiddleware,
@@ -195,10 +282,11 @@ class ImageItem(BaseModel):
     height: Optional[int] = Field(None, description="Image height in pixels")
     size_bytes: Optional[int] = Field(None, description="File size in bytes")
     base64: Optional[str] = Field(None, description="Base64 encoded image data")
-    format: Optional[str] = Field(None, description="Image format")
+    format: Optional[str] = Field(None, description="Image format (jpg, png, etc)") # MODIFIED
     saved_path: Optional[str] = Field(None, description="Local path where image is saved")
-    relevance_score: Optional[float] = Field(None, description="CLIP relevance score (0-1)")
-    is_solo: Optional[bool] = Field(None, description="True if person is alone in image")
+    relevance_score: float = Field(..., description="Text relevance score (0-1)")
+    is_solo: bool = Field(True, description="Whether the image shows a single person")
+    debug_scores: Optional[dict] = Field(None, description="Detailed relevance scores for debugging")
 
 
 class ScrapeResponse(BaseModel):
@@ -341,46 +429,67 @@ def extract_image_urls(html: str, base_url: str, query: str = "") -> list[dict]:
         # Find parent article/container and extract headline
         context_text = ""
         parent = img.parent
-        for _ in range(10):  # Walk up to 10 levels
+        for _ in range(10):  # Walk up to 10 levels (reverted to find broad context)
             if parent is None:
                 break
             # Look for article, heading, or text content
             if parent.name in ["article", "div", "a", "figure"]:
                 # Find headings
                 heading = parent.find(["h1", "h2", "h3", "h4", "h5", "h6"])
-                if heading:
-                    context_text += " " + heading.get_text().lower()
+                if heading and heading.get_text().strip():
+                    context_text += f" [HEAD]: {heading.get_text().strip().lower()}"
+                
                 # Find figcaption
                 caption = parent.find("figcaption")
-                if caption:
-                    context_text += " " + caption.get_text().lower()
+                if caption and caption.get_text().strip():
+                    context_text += f" [CAP]: {caption.get_text().strip().lower()}"
+                
                 # Get aria-label
                 aria = parent.get("aria-label", "")
-                if aria:
-                    context_text += " " + aria.lower()
+                if aria and aria.strip():
+                    context_text += f" [ARIA]: {aria.strip().lower()}"
+                
             parent = parent.parent
         
-        # Combine all context
-        all_context = f"{alt_text} {title_text} {context_text}".strip()
+        # Separate direct context (specific to image) from surrounding context
+        direct_context = f"{alt_text} {title_text}".strip()
+        surrounding_context = context_text.strip()
         
         # === RELEVANCE SCORING ===
         relevance_score = 0
-        if query_lower:
-            # Score based on query match in context
-            if query_lower in all_context:
-                relevance_score += 100  # Exact phrase match
-            else:
-                # Check if any query word matches
-                for word in query_words:
-                    if len(word) > 2 and word in all_context:
-                        relevance_score += 30
+        query_words = query_lower.split()
         
+        # 0. Format Boost (WebP is often main article image on Google News)
+        if "webp" in src.lower() or src.endswith("-rw"):  # Google News often uses -rw for WebP
+            relevance_score += 50
+        
+        # 1. Direct Match (Alt/Title) - Highest Priority
+        if query_lower in direct_context:
+            relevance_score += 1000
+        elif any(word in direct_context for word in query_words if len(word) > 3):
+            relevance_score += 500
+            
+        # 2. Check clear Caption/Figcaption (often reliable)
+        caption = img.find_parent("figure")
+        if caption:
+            caption_text = caption.get_text().lower()
+            if query_lower in caption_text:
+                relevance_score += 800
+            elif any(word in caption_text for word in query_words if len(word) > 3):
+                relevance_score += 400
+        
+        # 3. Surrounding Context (Headlines, Article) - Lower Priority
+        if query_lower in surrounding_context:
+            relevance_score += 100
+        elif any(word in surrounding_context for word in query_words if len(word) > 3):
+            relevance_score += 30
+            
         images.append({
             "src": src,
             "estimated_width": width,
             "estimated_height": height,
             "area": width * height,
-            "context": all_context[:500],  # Truncate for memory
+            "context": f"{direct_context} {surrounding_context}"[:500],  # Truncate for memory
             "relevance_score": relevance_score,
         })
     
@@ -489,7 +598,7 @@ async def download_and_validate_image(
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"status": "ok", "message": "Google News Image Scraper API v2.0 - CLIP Filtering"}
+    return {"status": "ok", "message": "Google News Image Scraper API v2.0 - Groq-powered filtering"}
 
 
 @app.get("/health", tags=["Health"])
@@ -497,6 +606,78 @@ async def health_check():
     """Health check endpoint for keep-alive pings."""
     return {"status": "healthy", "timestamp": __import__("datetime").datetime.now().isoformat()}
 
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check system state."""
+    import sys
+    import pkg_resources
+    return {
+        "python": sys.version,
+        "packages": [f"{p.key}=={p.version}" for p in pkg_resources.working_set],
+        "env": {k: v for k, v in os.environ.items() if "KEY" not in k and "TOKEN" not in k}
+    }
+
+
+async def process_candidate(
+    img_data: dict,
+    client: httpx.AsyncClient,
+    q: str,
+    query_info: dict,
+    strict: bool,
+    solo_only: bool,
+    min_width: int,
+    min_height: int,
+    seen_hashes: set[str],
+    allowed_formats: list[str] | None,
+) -> dict | None:
+    """
+    Process a single image candidate. Returns dict with image data (not saved yet).
+    Saving happens later after we select the top results.
+    """
+    context_text = img_data.get("context", "")
+
+    # Text-based relevance check (fast, no ML)
+    is_relevant, text_score, is_solo, scores_dict = check_text_relevance(
+        context_text, query_info, q
+    )
+
+    # Strict mode: require text relevance before downloading
+    if strict and not is_relevant:
+        return None
+
+    # Solo-only mode for person queries
+    if solo_only and query_info.get("type") == "person" and not is_solo:
+        if scores_dict.get("exact_match", 0) < 0.8:
+            return None
+
+    # Download the image
+    result = await download_and_validate_image(
+        client,
+        upscale_google_news_url(img_data["src"]),
+        min_width,
+        min_height,
+        seen_hashes,
+        allowed_formats,
+    )
+
+    if not result:
+        return None
+
+    # Prepare debug scores
+    scores_dict["metadata_relevance"] = img_data.get("relevance_score", 0)
+    scores_dict["context_snippet"] = context_text[:150]
+
+    # Return data dict (don't save yet)
+    return {
+        "url": img_data["src"],
+        "width": result["width"],
+        "height": result["height"],
+        "content": result["content"],  # Keep in memory for now
+        "format": result["format"],
+        "relevance_score": text_score,
+        "is_solo": is_solo,
+        "debug_scores": scores_dict,
+    }
 
 @app.get("/scrape", response_model=ScrapeResponse, tags=["Scraping"])
 async def scrape_images(
@@ -506,13 +687,14 @@ async def scrape_images(
     min_height: int = Query(default=100, ge=50, le=2000, description="Minimum image height"),
     include_base64: bool = Query(default=False, description="Include base64 data"),
     formats: Optional[str] = Query(default=None, description="Allowed formats: jpg,png,webp,gif"),
-    strict: bool = Query(default=True, description="Only return images that pass CLIP relevance check"),
+    strict: bool = Query(default=True, description="Only return images that pass text relevance check"),
     solo_only: bool = Query(default=True, description="For person queries, only return images of the person alone (not in groups)"),
 ):
     """
     Scrape exactly `count` unique images from Google News.
-    
-    Uses streaming approach: processes images one-by-one, stops when target reached.
+
+    Uses Groq LLM for intelligent query understanding and text-based filtering.
+    No heavy ML models - fast and lightweight for deployment.
     """
     try:
         # Parse formats
@@ -521,25 +703,29 @@ async def scrape_images(
             allowed_formats = [f.strip().lower() for f in formats.split(",")]
             valid = {"jpg", "jpeg", "png", "webp", "gif"}
             allowed_formats = [f for f in allowed_formats if f in valid] or None
-        
+
         # Create response folder
         safe_name = re.sub(r'[^\w\s-]', '', q).strip().replace(' ', '_').lower()
         if not safe_name:
             safe_name = f"query_{hashlib.md5(q.encode()).hexdigest()[:8]}"
-        
+
         response_folder = RESPONSE_DIR / safe_name
         response_folder.mkdir(parents=True, exist_ok=True)
-        
+
         # Clear existing images
         for ext in ["jpg", "png", "webp", "gif", "jpeg"]:
             for f in response_folder.glob(f"*.{ext}"):
                 f.unlink(missing_ok=True)
-        
+
         # Build Google News URL
         url = f"https://news.google.com/search?q={quote_plus(q)}"
-        
-        # Fetch page content with httpx (no browser needed)
+
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            # Step 1: Analyze query with Groq (fast, cached)
+            query_info = await analyze_query_with_groq(q, client)
+            print(f"Query '{q}' analyzed: type={query_info.get('type')}, aliases={query_info.get('aliases', [])[:3]}")
+
+            # Step 2: Fetch Google News page
             response = await client.get(
                 url,
                 headers={
@@ -551,90 +737,99 @@ async def scrape_images(
                     "Upgrade-Insecure-Requests": "1",
                 }
             )
-            
+
             if response.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Failed to fetch Google News: {response.status_code}")
-            
+
             html_content = response.text
             final_url = str(response.url)
-        
+
         # Extract all image URLs with context and relevance scoring
         image_urls = extract_image_urls(html_content, final_url, query=q)
         total_found = len(image_urls)
-        
-        # Stream through images until we have enough
-        images: list[ImageItem] = []
+
+        # Parallel Processing with text-based filtering (no heavy ML)
+        candidates: list[dict] = []
+        target_buffer_size = count * 3  # Process more candidates since text filtering is fast
         seen_hashes: set[str] = set()
-        processed = 0
-        
+
+        sem = asyncio.Semaphore(15)  # Higher concurrency since text filtering is fast
+
         async with httpx.AsyncClient() as client:
-            for img_data in image_urls:
-                if len(images) >= count:
-                    break  # Early termination - we have enough!
-                
-                processed += 1
-                
-                # Strict mode: skip images without query in context
-                if strict and img_data.get("relevance_score", 0) == 0:
-                    continue
-                
-                result = await download_and_validate_image(
-                    client,
-                    upscale_google_news_url(img_data["src"]),  # Request full-size image
-                    min_width,
-                    min_height,
-                    seen_hashes,
-                    allowed_formats,
-                )
-                
-                if result:
-                    # CLIP semantic check - is the image actually about the query?
-                    is_relevant, clip_score, is_solo = check_image_relevance(
-                        result["content"], 
-                        q,
-                        threshold=0.2,  # 20% threshold for relevance
-                        solo_only=solo_only
+            async def semaphore_task(img_data):
+                async with sem:
+                    return await process_candidate(
+                        img_data, client, q, query_info, strict, solo_only,
+                        min_width, min_height, seen_hashes, allowed_formats
                     )
-                    
-                    if strict and not is_relevant:
-                        # Skip images that don't pass CLIP check in strict mode
-                        continue
-                    
-                    # Save to response folder
-                    idx = len(images) + 1
-                    filename = f"image_{idx:03d}.{result['format']}"
-                    save_path = response_folder / filename
-                    save_path.write_bytes(result["content"])
-                    
-                    # Build response item
-                    item = ImageItem(
-                        url=result["url"],
-                        width=result["width"],
-                        height=result["height"],
-                        size_bytes=result["size_bytes"],
-                        format=result["format"],
-                        saved_path=str(save_path),
-                        relevance_score=round(clip_score, 3),
-                        is_solo=is_solo,
-                    )
-                    
-                    if include_base64:
-                        item.base64 = base64.b64encode(result["content"]).decode()
-                    
-                    images.append(item)
-        
+
+            tasks = []
+            for img_data in image_urls[:target_buffer_size]:
+                tasks.append(semaphore_task(img_data))
+
+            # Run all tasks
+            results = await asyncio.gather(*tasks)
+
+            # Filter None (failed/skipped)
+            candidates = [r for r in results if r is not None]
+
+        # Sort candidates by relevance
+        def candidate_sort_key(item: dict):
+            meta_score = item.get("debug_scores", {}).get("metadata_relevance", 0)
+            exact_match = item.get("debug_scores", {}).get("exact_match", 0)
+            is_webp = 1 if item.get("format") == "webp" else 0
+            return (exact_match, meta_score, is_webp, item.get("relevance_score", 0))
+
+        candidates.sort(key=candidate_sort_key, reverse=True)
+
+        # Homogeneity Filter: prefer WebP images (often main article images on Google News)
+        if strict and any(c.get("format") == "webp" for c in candidates):
+            webp_candidates = [c for c in candidates if c.get("format") == "webp"]
+            if len(webp_candidates) >= count:
+                candidates = webp_candidates
+
+        # Take top `count` and save ONLY those to disk
+        final_candidates = candidates[:count]
+        images: list[ImageItem] = []
+
+        for i, cand in enumerate(final_candidates):
+            filename = f"image_{i + 1:03d}.{cand['format']}"
+            filepath = response_folder / filename
+            with open(filepath, "wb") as f:
+                f.write(cand["content"])
+
+            # Convert to base64 if requested
+            b64_str = None
+            if include_base64:
+                b64_str = base64.b64encode(cand["content"]).decode("utf-8")
+
+            images.append(ImageItem(
+                url=cand["url"],
+                width=cand["width"],
+                height=cand["height"],
+                size_bytes=len(cand["content"]),
+                base64=b64_str,
+                format=cand["format"],
+                saved_path=str(filepath),
+                relevance_score=float(cand["relevance_score"]),
+                is_solo=cand["is_solo"],
+                debug_scores=cand["debug_scores"],
+            ))
+
         return ScrapeResponse(
             success=True,
             query=q,
             requested_count=count,
             total_found=total_found,
-            total_processed=processed,
+            total_processed=len(tasks),
             total_returned=len(images),
             images=images,
             response_folder=str(response_folder),
         )
-        
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
 
 
