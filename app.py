@@ -82,11 +82,11 @@ def check_image_relevance(
         )
         
         if is_person_query:
-            # Very specific prompts to detect person's FACE
+            # More inclusive prompts to handle masked characters (e.g. Spiderman)
             labels = [
-                f"a close-up photo showing {query}'s face clearly visible",
+                f"a close-up photo showing {query}, face or mask clearly visible",
                 f"a photo of {query} standing with other people in a group",
-                "a photo of a building, landscape, or scene without any person's face",
+                "a photo of a building, landscape, or scene without any person",
                 "a photo of someone else, a different person",
             ]
         else:
