@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 from pathlib import Path
@@ -35,12 +36,32 @@ from starlette.concurrency import run_in_threadpool
 # Response folder path
 RESPONSE_DIR = Path(__file__).parent / "response"
 
-# Browser User-Agent
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+# Rotating User-Agents to avoid rate limiting on datacenter IPs
+USER_AGENTS = [
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    # Chrome on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    # Firefox on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
+    # Chrome on Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    # Safari on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+]
+
+
+def get_random_user_agent() -> str:
+    """Get a random browser User-Agent to avoid rate limiting."""
+    return random.choice(USER_AGENTS)
 
 # Known logo/icon hashes to block
 BLOCKED_HASHES = {"8c30b0eaece8e454"}  # Google News logo
@@ -516,7 +537,7 @@ async def download_and_validate_image(
             url,
             timeout=15.0,
             follow_redirects=True,
-            headers={"User-Agent": BROWSER_USER_AGENT},
+            headers={"User-Agent": get_random_user_agent()},
         )
         
         if response.status_code != 200:
@@ -729,7 +750,7 @@ async def scrape_images(
             response = await client.get(
                 url,
                 headers={
-                    "User-Agent": BROWSER_USER_AGENT,
+                    "User-Agent": get_random_user_agent(),
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.5",
                     "Accept-Encoding": "gzip, deflate",
